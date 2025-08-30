@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
 Streamlit UI for exporting precinct-level election data back to the original wide format,
-with per-run mapping overrides, selective race inclusion, and a diff tool.
+with per-run mapping overrides, selective race inclusion (combined in one editor), and a diff tool.
 
 Key behaviors:
 - Uses only DATABASE_URL env var (no input box).
 - ballots_cast column is present but intentionally left blank in exports.
-- UI: map election.name -> vote type (overrides apply for this run only).
-- UI: pick a subset of election names to include (e.g., only Presidential races).
+- One editor: select which elections to include AND map election.name -> vote type.
 - Diff: treats numeric zero as equal to blank; excludes ballots_cast from comparisons.
 - Softer theme and wider preview table.
 
@@ -133,7 +132,7 @@ def guess_vote_type(name: str) -> str:
 
 @st.cache_data(show_spinner=False)
 def list_election_names_with_suggestion(
-        db_url: str, state: str, year: int, county_or_all: str
+    db_url: str, state: str, year: int, county_or_all: str
 ) -> Tuple[pd.DataFrame, str]:
     """
     Return (df, source), where df has columns [election_name, suggested_type, vote_type]
@@ -201,12 +200,12 @@ def build_name_filter_clause(names: Optional[List[str]], params: Dict[str, objec
     return " AND e.name IN (" + ", ".join(placeholders) + ")"
 
 def build_combined_query(
-        state: str,
-        year: int,
-        county_or_all: str,
-        overrides: Dict[str, str],
-        use_map: bool,
-        include_names: Optional[List[str]],
+    state: str,
+    year: int,
+    county_or_all: str,
+    overrides: Dict[str, str],
+    use_map: bool,
+    include_names: Optional[List[str]],
 ) -> Tuple[str, Dict]:
     """
     Build SQL + params to produce the combined export, with optional per-run overrides
@@ -320,7 +319,7 @@ def build_combined_query(
       MAX(CASE WHEN s.vote_type='Absentee Votes' THEN ep.candidate_b_votes END) AS candidate_b_votes_absentee,
       MAX(CASE WHEN s.vote_type='Absentee Votes' THEN ep.total_votes        END) AS total_votes_absentee,
       MAX(CASE WHEN s.vote_type='Mail In Votes' THEN ep.candidate_a_votes END) AS candidate_a_votes_mailin,
-      MAX(CASE WHEN s.vote_type='Mail In Votes' THEN ep.candidate_b_votes END) AS candidate_b_votes_mailin,
+      MAX(CASE WHEN s.vote_type='Mail In Votes' THEN ep.candidate_b_votes END) AS candidate_a_votes_mailin,
       MAX(CASE WHEN s.vote_type='Mail In Votes' THEN ep.total_votes        END) AS total_votes_mailin
     FROM scoped s
     JOIN public.election_precincts ep ON ep.election_id = s.id
@@ -329,14 +328,43 @@ def build_combined_query(
     """
     return sql, params
 
+
+def _fix_accidental_alias_dupes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    If a copy/paste error produced duplicate column names like 'candidate_a_votes_early'
+    while 'candidate_b_votes_early' is missing, rename the second occurrence to the
+    expected 'candidate_b' column name. Repeat for absentee/e-day/mailin/total.
+    This is a defensive guard and should rarely run if SQL aliases are correct.
+    """
+    pairs = [
+        ("candidate_a_votes_total", "candidate_b_votes_total"),
+        ("candidate_a_votes_election_day", "candidate_b_votes_election_day"),
+        ("candidate_a_votes_early", "candidate_b_votes_early"),
+        ("candidate_a_votes_absentee", "candidate_b_votes_absentee"),
+        ("candidate_a_votes_mailin", "candidate_b_votes_mailin"),
+    ]
+
+    cols = list(df.columns)
+    changed = False
+    for a_col, b_col in pairs:
+        if cols.count(a_col) > 1 and b_col not in cols:
+            # rename the second occurrence to b_col
+            idxs = [i for i, c in enumerate(cols) if c == a_col]
+            if len(idxs) >= 2:
+                cols[idxs[1]] = b_col
+                changed = True
+    if changed:
+        df.columns = cols
+    return df
+
 @st.cache_data(show_spinner=True)
 def fetch_combined(
-        db_url: str,
-        state: str,
-        year: int,
-        county_or_all: str,
-        overrides: Dict[str, str],
-        include_names: Optional[List[str]],
+    db_url: str,
+    state: str,
+    year: int,
+    county_or_all: str,
+    overrides: Dict[str, str],
+    include_names: Optional[List[str]],
 ) -> pd.DataFrame:
     eng = get_engine(db_url)
 
@@ -347,6 +375,7 @@ def fetch_combined(
         try:
             with eng.connect() as conn:
                 df = pd.read_sql(sql=text(sql), con=conn, params=params)
+            df = _fix_accidental_alias_dupes(df)
             break
         except Exception:
             if attempt == 0:
@@ -416,8 +445,8 @@ def values_equal(v1: str, v2: str, float_tol: float, case_sensitive: bool) -> bo
     return False
 
 def diff_dataframes(
-        df1: pd.DataFrame, df2: pd.DataFrame, compare_cols: Optional[List[str]],
-        float_tol: float, case_sensitive: bool
+    df1: pd.DataFrame, df2: pd.DataFrame, compare_cols: Optional[List[str]],
+    float_tol: float, case_sensitive: bool
 ) -> pd.DataFrame:
     KEYS = ["state","county","precinct"]
     for k in KEYS:
@@ -477,7 +506,7 @@ def diff_dataframes(
 
 # ---------- UI ----------
 st.title("Precinct Exporter & Diff")
-st.caption("Select State → Year → County, map/choose races, export combined CSV, and (optionally) diff against an original file.")
+st.caption("Select State → Year → County, choose/map elections (in one editor), export combined CSV, and (optionally) diff.")
 
 db_url = os.getenv("DATABASE_URL", "").strip()
 if not db_url:
@@ -500,74 +529,79 @@ year = st.selectbox("Year", years, index=year_idx)
 counties = ["All"] + list_counties(db_url, state, year)
 county = st.selectbox("County", counties, index=0)
 
-# Mapping editor
-st.subheader("Map election names to vote types (optional)")
-st.caption("If a mapping table isn't found, I'll use a heuristic to suggest the type. Your changes below override for this export only.")
+# --- Combined editor: include + map vote types ---
+st.subheader("Pick elections to include & map their vote types")
+st.caption("Check Include for the races you want (e.g., Presidential), and adjust their vote type if needed.")
+
 map_df, map_source = list_election_names_with_suggestion(db_url, state, year, county)
+map_df.insert(0, "include", True)  # default include everything
 st.caption(f"Suggestions source: {'public.vote_type_map' if map_source == 'map' else 'heuristic'}")
 
 edited_df = st.data_editor(
-    map_df,
+    map_df[["include", "election_name", "suggested_type", "vote_type"]],
     hide_index=True,
     column_config={
+        "include": st.column_config.CheckboxColumn("Include", help="Export & diff will only use rows that are checked."),
         "election_name": st.column_config.TextColumn("Election Name", disabled=True, width="large"),
         "suggested_type": st.column_config.TextColumn("Suggested", disabled=True),
         "vote_type": st.column_config.SelectboxColumn("Vote Type", options=VTYPE_ORDER, required=True),
     },
     use_container_width=True,
     num_rows="fixed",
+    key="combined_editor",
 )
 
-# Choose which election names to include (e.g., only Presidential)
-all_names = edited_df["election_name"].tolist()
-include_names = st.multiselect(
-    "Elections to include in export & diff",
-    options=all_names,
-    default=all_names,
-    help="Pick a subset if you only want, say, the Presidential races (e.g., 3 of 6)."
-)
-
-# Build overrides only for included names
+# Derive include set and overrides from the single editor
+included_rows = edited_df[edited_df["include"] == True]
+include_names = included_rows["election_name"].tolist()
 overrides: Dict[str, str] = {}
-included_set = set(include_names)
-for _, r in edited_df.iterrows():
-    ename = str(r["election_name"])
-    if ename in included_set and r["vote_type"] != r["suggested_type"]:
-        overrides[ename] = str(r["vote_type"])
+for _, r in included_rows.iterrows():
+    if r["vote_type"] != r["suggested_type"]:
+        overrides[str(r["election_name"])] = str(r["vote_type"])
+
+if len(include_names) == 0:
+    st.warning("No elections selected. Select at least one to enable preview/export/diff.")
 
 # Preview & Export (wider preview)
 col_prev, col_export = st.columns([3, 1])
 with col_prev:
-    if st.button("Preview (first 100 rows)"):
+    if st.button("Preview (first 100 rows)", disabled=(len(include_names) == 0)):
         df_preview = fetch_combined(db_url, state, year, county, overrides, include_names)
         st.write(f"Rows: {len(df_preview):,}")
         st.dataframe(df_preview.head(100), use_container_width=True)
 
 with col_export:
-    df_export = fetch_combined(db_url, state, year, county, overrides, include_names)
-    fname = f"{state}__{county}__{year}.csv"
-    st.download_button("Export CSV", data=df_export.to_csv(index=False), file_name=fname, mime="text/csv")
+    df_export = fetch_combined(db_url, state, year, county, overrides, include_names) if include_names else pd.DataFrame()
+    st.download_button(
+        "Export CSV",
+        data=df_export.to_csv(index=False) if not df_export.empty else "",
+        file_name=f"{state}__{county}__{year}.csv",
+        mime="text/csv",
+        disabled=df_export.empty,
+    )
 
 st.markdown("---")
-st.subheader("Diff against original imported file (path on disk)")
-st.caption("Enter a local path to your original CSV (e.g., /Users/you/Downloads/original.csv or C:\\\\path\\\\file.csv).")
-orig_path = st.text_input("Original CSV path")
+st.subheader("Diff against original imported file")
+st.caption("Drag & drop or browse to upload your original CSV; diffs treat 0 as blank and ignore ballots_cast.")
+orig_file = st.file_uploader("Original CSV", type=["csv"], key="orig_uploader")
 float_tol = st.number_input("Numeric tolerance", min_value=0.0, max_value=100000.0, value=0.0, step=0.1)
 case_sensitive = st.checkbox("Case-sensitive string compare", value=False)
 
-compare_cols = None
-if st.button("Run Diff", type="primary"):
-    if not orig_path or not os.path.isfile(orig_path):
-        st.error("Original CSV path not found. Please enter a valid local file path.")
+# Choose columns after we have both dataframes
+if st.button("Run Diff", type="primary", disabled=(orig_file is None or len(include_names) == 0)):
+    if orig_file is None:
+        st.error("Please upload a CSV to compare against.")
+    elif len(include_names) == 0:
+        st.error("Please select at least one election to include.")
     else:
         df_combined_for_diff = fetch_combined(db_url, state, year, county, overrides, include_names)
-        df_original = pd.read_csv(orig_path, dtype=str, keep_default_na=False)
+        df_original = pd.read_csv(orig_file, dtype=str, keep_default_na=False)
+
         shared_cols = sorted(list((set(df_combined_for_diff.columns) & set(df_original.columns)) - {"state","county","precinct","ballots_cast"}))
         with st.expander("Choose columns to compare (optional)"):
             chosen = st.multiselect("Columns", options=shared_cols, default=shared_cols, key="compare_cols_picker")
             compare_cols = chosen if chosen else shared_cols
 
-        # Run immediately with chosen (or default) columns
         diffs = diff_dataframes(df_original, df_combined_for_diff, compare_cols or None, float_tol=float_tol, case_sensitive=case_sensitive)
         st.write(f"Found **{len(diffs):,}** difference records.")
         st.dataframe(diffs.head(200), use_container_width=True)
