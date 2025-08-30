@@ -3,20 +3,21 @@
 Streamlit UI for exporting precinct-level election data back to the original wide format,
 with optional per-run overrides that map election names to vote types, and a diff tool.
 
-Changes (per 2025-08-30 request):
-- Keep 'ballots_cast' column in the export but leave it BLANK.
-- Add a UI section to map 'election.name' -> vote type (Total/Election Day/Early/Absentee/Mail In).
-  These overrides apply only to this run (not saved to DB).
+Key behaviors:
+- Uses only DATABASE_URL env var (no input box).
+- ballots_cast column is present but intentionally left blank in exports.
+- Allows mapping election.name -> vote type in the UI (overrides apply for this run only).
+- If public.vote_type_map doesn't exist, falls back to heuristics.
+- Softer theme and wider preview table.
 
 Run:
-  pip install -r requirements.txt
   export DATABASE_URL='postgresql://user:pass@host:5432/dbname'
   streamlit run streamlit_app.py
 """
 
 import os
 import re
-from typing import List, Optional, Tuple, Dict
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -29,32 +30,66 @@ try:
 except Exception:
     pass  # optional
 
+# ---------- Page / Style ----------
+st.set_page_config(page_title="Precinct Exporter & Diff", layout="wide")
 
-st.set_page_config(page_title="Precinct Exporter", layout="wide")
+def _inject_soft_theme():
+    st.markdown(
+        """
+        <style>
+        /* Softer background + header */
+        .stApp { background-color: #f7f8fc; }
+        [data-testid="stHeader"] { background-color: #f7f8fc; }
+        div[data-testid="stToolbar"] { background-color: #f7f8fc; }
+
+        /* Buttons and download buttons - soft indigo */
+        .stButton > button, .stDownloadButton > button {
+            background-color: #6b7fd1 !important;
+            border: 1px solid #6b7fd1 !important;
+            color: #ffffff !important;
+            border-radius: 6px !important;
+        }
+        .stButton > button:hover, .stDownloadButton > button:hover {
+            background-color: #5f72c1 !important;
+            border-color: #5f72c1 !important;
+        }
+
+        /* Expander headers */
+        details > summary {
+            background-color: #eef1fb !important;
+            border-radius: 6px !important;
+            padding: 6px 10px !important;
+        }
+
+        /* Dataframe container subtle border */
+        div[data-testid="stDataFrame"] {
+            border: 1px solid #e6e9f3;
+            border-radius: 6px;
+            padding: 4px;
+            background-color: #ffffff;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+_inject_soft_theme()
 
 VTYPE_ORDER = ["Total Votes", "Election Day Votes", "Early Votes", "Absentee Votes", "Mail In Votes"]
 YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 
-# ---------- Helpers: DB ----------
-
+# ---------- DB helpers ----------
 def get_engine(db_url: Optional[str]) -> Engine:
     if not db_url:
         db_url = os.getenv("DATABASE_URL", "").strip()
     if not db_url:
+        st.error("DATABASE_URL env var is required. Set it before launching.")
         st.stop()
     eng = create_engine(db_url, pool_pre_ping=True)
     # sanity ping
     with eng.connect() as conn:
         conn.execute(text("SELECT 1"))
     return eng
-
-@st.cache_data(show_spinner=False)
-def table_exists(db_url: str, table_fqname: str) -> bool:
-    eng = get_engine(db_url)
-    with eng.connect() as conn:
-        q = text("SELECT to_regclass(:tname)")
-        val = conn.execute(q, {"tname": table_fqname}).scalar()
-    return val is not None
 
 @st.cache_data(show_spinner=False)
 def list_states(db_url: str) -> List[str]:
@@ -86,7 +121,6 @@ def list_counties(db_url: str, state: str, year: int) -> List[str]:
         rows = conn.execute(sql, {"s": state, "y": int(year)}).fetchall()
     return [r[0] for r in rows]
 
-
 def guess_vote_type(name: str) -> str:
     n = name.lower()
     if "mail-in" in n or "mail in" in n: return "Mail In Votes"
@@ -96,21 +130,25 @@ def guess_vote_type(name: str) -> str:
     if "all votes" in n or "total" in n: return "Total Votes"
     return "Total Votes"
 
-
 @st.cache_data(show_spinner=False)
-def list_election_names_with_suggestion(db_url: str, state: str, year: int, county_or_all: str) -> pd.DataFrame:
-    """Return distinct election names in scope and the suggested vote type (from map table if present, else heuristic)."""
+def list_election_names_with_suggestion(
+        db_url: str, state: str, year: int, county_or_all: str
+) -> Tuple[pd.DataFrame, str]:
+    """
+    Return (df, source), where df has columns [election_name, suggested_type, vote_type]
+    and source is "map" if vote_type_map was used, else "heuristic".
+    Gracefully falls back to heuristic if the mapping table doesn't exist or errors.
+    """
     eng = get_engine(db_url)
     county = None if (county_or_all is None or county_or_all.strip().lower() == "all") else county_or_all.strip()
-    use_map = table_exists(db_url, "public.vote_type_map")
 
-    if use_map:
-        where = "e.state = :s AND e.year = :y"
-        params = {"s": state, "y": int(year)}
-        if county:
-            where += " AND e.county = :c"
-            params["c"] = county
-        sql = f"""
+    params = {"s": state, "y": int(year)}
+    if county:
+        params["c"] = county
+
+    # ----- Try mapping table first -----
+    where_map = "e.state = :s AND e.year = :y" + (" AND e.county = :c" if county else "")
+    sql_map = f"""
         SELECT DISTINCT
             e.name AS election_name,
             COALESCE(
@@ -127,32 +165,35 @@ def list_election_names_with_suggestion(db_url: str, state: str, year: int, coun
               'Total Votes'
             ) AS suggested_type
         FROM public.elections e
-        WHERE {where}
+        WHERE {where_map}
         ORDER BY 1
+    """
+    try:
+        with eng.connect() as conn:
+            df = pd.read_sql(sql=text(sql_map), con=conn, params=params)
+        df["vote_type"] = df["suggested_type"]
+        return df[["election_name", "suggested_type", "vote_type"]], "map"
+    except Exception:
+        # ----- Fallback: heuristic (ALSO aliased as e) -----
+        where_simple = "e.state = :s AND e.year = :y" + (" AND e.county = :c" if county else "")
+        sql_names = f"""
+            SELECT DISTINCT e.name AS election_name
+            FROM public.elections e
+            WHERE {where_simple}
+            ORDER BY 1
         """
         with eng.connect() as conn:
-            df = pd.read_sql(sql=text(sql), con=conn, params=params)
-    else:
-        # No map table; suggest via heuristic
-        where = "state = :s AND year = :y"
-        params = {"s": state, "y": int(year)}
-        if county:
-            where += " AND county = :c"
-            params["c"] = county
-        sql = f"SELECT DISTINCT name AS election_name FROM public.elections WHERE {where} ORDER BY 1"
-        with eng.connect() as conn:
-            names = pd.read_sql(sql=text(sql), con=conn, params=params)
+            names = pd.read_sql(sql=text(sql_names), con=conn, params=params)
         names["suggested_type"] = names["election_name"].apply(guess_vote_type)
-        df = names
+        names["vote_type"] = names["suggested_type"]
+        return names[["election_name", "suggested_type", "vote_type"]], "heuristic"
 
-    df["vote_type"] = df["suggested_type"]  # default editable column
-    return df[["election_name", "suggested_type", "vote_type"]]
-
-
-def build_combined_query(state: str, year: int, county_or_all: str, overrides: Dict[str, str], use_map: bool) -> Tuple[str, Dict]:
+def build_combined_query(
+        state: str, year: int, county_or_all: str, overrides: Dict[str, str], use_map: bool
+) -> Tuple[str, Dict]:
     """
-    Build SQL + params to produce the combined export, with optional per-run overrides of vote types by election name.
-    ballots_cast is intentionally left blank in the final DataFrame (handled after query).
+    Build SQL + params to produce the combined export, with optional per-run overrides
+    of vote types by election name. ballots_cast is blanked after the query.
     """
     county = None if (county_or_all is None or county_or_all.strip().lower() == "all") else county_or_all.strip()
     params: Dict[str, object] = {"state": state, "year": int(year)}
@@ -162,9 +203,9 @@ def build_combined_query(state: str, year: int, county_or_all: str, overrides: D
         where += " AND e.county = :county"
         params["county"] = county
 
-    # Base: decide vote_type (map table or heuristic)
+    # CTE 1: scoped_base
     if use_map:
-        base = f"""
+        scoped_base_cte = f"""
         scoped_base AS (
           SELECT
             e.id, e.state, e.county, e.year, e.name,
@@ -181,10 +222,9 @@ def build_combined_query(state: str, year: int, county_or_all: str, overrides: D
             LIMIT 1
           ) vtm ON TRUE
           WHERE {where}
-        )
-        """
+        )"""
     else:
-        base = f"""
+        scoped_base_cte = f"""
         scoped_base AS (
           SELECT
             e.id, e.state, e.county, e.year, e.name,
@@ -198,43 +238,40 @@ def build_combined_query(state: str, year: int, county_or_all: str, overrides: D
             END AS vote_type_base
           FROM public.elections e
           WHERE {where}
-        )
-        """
+        )"""
 
-    # Overrides: VALUES list if provided
+    # CTE 2: overrides (optional)
     overrides_cte = ""
     if overrides:
         values_sql = []
-        i = 0
-        for name, vtype in overrides.items():
+        for i, (name, vtype) in enumerate(overrides.items()):
             params[f"ov_name_{i}"] = name
             params[f"ov_type_{i}"] = vtype
             values_sql.append(f"(:ov_name_{i}, :ov_type_{i})")
-            i += 1
-        overrides_cte = f"overrides(name, vote_type) AS (VALUES {', '.join(values_sql)}),"
+        overrides_cte = f"overrides(name, vote_type) AS (VALUES {', '.join(values_sql)})"
 
-        scoped = """
+    # CTE 3: scoped -> apply overrides
+    if overrides_cte:
+        scoped_cte = """
         scoped AS (
           SELECT sb.id, sb.state, sb.county, sb.year, sb.name,
                  COALESCE(o.vote_type, sb.vote_type_base) AS vote_type
           FROM scoped_base sb
           LEFT JOIN overrides o ON o.name = sb.name
-        )
-        """
+        )"""
     else:
-        scoped = """
+        scoped_cte = """
         scoped AS (
           SELECT sb.id, sb.state, sb.county, sb.year, sb.name, sb.vote_type_base AS vote_type
           FROM scoped_base sb
-        )
-        """
+        )"""
 
-    # Final export query, note: ballots_cast intentionally not computed here
+    with_clause = "WITH " + ",\n      ".join(
+        [scoped_base_cte.strip()] + ([overrides_cte.strip()] if overrides_cte else []) + [scoped_cte.strip()]
+    )
+
     sql = f"""
-    WITH
-      {base}
-      {overrides_cte}
-      {scoped}
+    {with_clause}
     SELECT
       s.state,
       s.county,
@@ -246,7 +283,7 @@ def build_combined_query(state: str, year: int, county_or_all: str, overrides: D
         MAX(CASE WHEN s.vote_type='Absentee Votes' THEN ep.turnout_pct END),
         MAX(CASE WHEN s.vote_type='Mail In Votes' THEN ep.turnout_pct END)
       ) AS overall_turnout,
-      -- ballots_cast intentionally omitted (will be blanked later)
+      -- ballots_cast intentionally omitted (blanked later)
       MAX(ep.registered_voters)         AS registered_voters,
       MAX(ep.republican_registrations)  AS republican_registrations,
       MAX(ep.democrat_registrations)    AS democrat_registrations,
@@ -273,16 +310,24 @@ def build_combined_query(state: str, year: int, county_or_all: str, overrides: D
     """
     return sql, params
 
-
 @st.cache_data(show_spinner=True)
 def fetch_combined(db_url: str, state: str, year: int, county_or_all: str, overrides: Dict[str, str]) -> pd.DataFrame:
     eng = get_engine(db_url)
-    use_map = table_exists(db_url, "public.vote_type_map")
-    sql, params = build_combined_query(state, int(year), county_or_all, overrides, use_map)
-    with eng.connect() as conn:
-        df = pd.read_sql(sql=text(sql), con=conn, params=params)
 
-    # Ensure required columns & order
+    # Try with mapping table; on error, fallback to heuristic
+    for attempt in (0, 1):
+        use_map = (attempt == 0)
+        sql, params = build_combined_query(state, int(year), county_or_all, overrides, use_map)
+        try:
+            with eng.connect() as conn:
+                df = pd.read_sql(sql=text(sql), con=conn, params=params)
+            break
+        except Exception:
+            if attempt == 0:
+                continue
+            raise
+
+    # Ensure required columns & order; blank ballots_cast
     cols = [
         "state","county","precinct","overall_turnout","ballots_cast",
         "registered_voters","republican_registrations","democrat_registrations","other_registrations",
@@ -295,14 +340,11 @@ def fetch_combined(db_url: str, state: str, year: int, county_or_all: str, overr
     for c in cols:
         if c not in df.columns:
             df[c] = ""
-    # Per request: ballots_cast must be present but BLANK
-    df["ballots_cast"] = ""
+    df["ballots_cast"] = ""  # per spec
     df = df[cols]
     return df
 
-
-# ---------- Diff helper (unchanged behavior) ----------
-
+# ---------- Diff helpers ----------
 def normalize_value(s: str, case_sensitive: bool) -> str:
     if s is None:
         return ""
@@ -327,7 +369,10 @@ def values_equal(v1: str, v2: str, float_tol: float, case_sensitive: bool) -> bo
         return abs(f1 - f2) <= float_tol
     return False
 
-def diff_dataframes(df1: pd.DataFrame, df2: pd.DataFrame, compare_cols: Optional[List[str]], float_tol: float, case_sensitive: bool) -> pd.DataFrame:
+def diff_dataframes(
+        df1: pd.DataFrame, df2: pd.DataFrame, compare_cols: Optional[List[str]],
+        float_tol: float, case_sensitive: bool
+) -> pd.DataFrame:
     KEYS = ["state","county","precinct"]
     for k in KEYS:
         if k not in df1.columns or k not in df2.columns:
@@ -346,31 +391,22 @@ def diff_dataframes(df1: pd.DataFrame, df2: pd.DataFrame, compare_cols: Optional
     only_f1 = merged["_merge"] == "left_only"
     for _, row in merged[only_f1].iterrows():
         diffs.append({
-            "state": row["state"],
-            "county": row["county"],
-            "precinct": row["precinct"],
-            "diff_type": "missing_in_file2",
-            "column": "",
-            "file1_value": "ROW_PRESENT",
-            "file2_value": "ROW_MISSING",
+            "state": row["state"], "county": row["county"], "precinct": row["precinct"],
+            "diff_type": "missing_in_file2", "column": "",
+            "file1_value": "ROW_PRESENT", "file2_value": "ROW_MISSING",
             "description": "Row exists in file1 but not in file2."
         })
 
     only_f2 = merged["_merge"] == "right_only"
     for _, row in merged[only_f2].iterrows():
         diffs.append({
-            "state": row["state"],
-            "county": row["county"],
-            "precinct": row["precinct"],
-            "diff_type": "missing_in_file1",
-            "column": "",
-            "file1_value": "ROW_MISSING",
-            "file2_value": "ROW_PRESENT",
+            "state": row["state"], "county": row["county"], "precinct": row["precinct"],
+            "diff_type": "missing_in_file1", "column": "",
+            "file1_value": "ROW_MISSING", "file2_value": "ROW_PRESENT",
             "description": "Row exists in file2 but not in file1."
         })
 
-    both = merged["_merge"] == "both"
-    both_df = merged[both]
+    both_df = merged[merged["_merge"] == "both"]
 
     for col in compare_cols:
         c1, c2 = f"{col}__f1", f"{col}__f2"
@@ -381,13 +417,9 @@ def diff_dataframes(df1: pd.DataFrame, df2: pd.DataFrame, compare_cols: Optional
             v2 = "" if pd.isna(row[c2]) else str(row[c2])
             if not values_equal(v1, v2, float_tol=float_tol, case_sensitive=case_sensitive):
                 diffs.append({
-                    "state": row["state"],
-                    "county": row["county"],
-                    "precinct": row["precinct"],
-                    "diff_type": "value_mismatch",
-                    "column": col,
-                    "file1_value": v1,
-                    "file2_value": v2,
+                    "state": row["state"], "county": row["county"], "precinct": row["precinct"],
+                    "diff_type": "value_mismatch", "column": col,
+                    "file1_value": v1, "file2_value": v2,
                     "description": f"Column '{col}' differs (file1 vs file2)."
                 })
 
@@ -395,20 +427,15 @@ def diff_dataframes(df1: pd.DataFrame, df2: pd.DataFrame, compare_cols: Optional
     out.sort_values(by=["state","county","precinct","diff_type","column"], inplace=True, kind="stable")
     return out
 
-
 # ---------- UI ----------
-
 st.title("Precinct Exporter & Diff")
 st.caption("Select State → Year → County, map election names to vote types if needed, and export a combined CSV. Optionally diff against an original file.")
 
-# DB URL input
-default_db = os.getenv("DATABASE_URL", "")
-db_url = st.text_input("Database URL (postgresql://...)", value=default_db, type="password" if default_db == "" else "default", help="You can also set the DATABASE_URL environment variable before launching.")
-if not db_url and not default_db:
-    st.info("Enter your database URL to continue.")
+db_url = os.getenv("DATABASE_URL", "").strip()
+if not db_url:
+    st.error("DATABASE_URL env var is required. Set it before launching.")
     st.stop()
 
-# Load choices
 states = list_states(db_url)
 if not states:
     st.warning("No states found in `public.elections`.")
@@ -425,10 +452,11 @@ year = st.selectbox("Year", years, index=year_idx)
 counties = ["All"] + list_counties(db_url, state, year)
 county = st.selectbox("County", counties, index=0)
 
-# --- Mapping editor ---
+# Mapping editor
 st.subheader("Map election names to vote types (optional)")
-map_df = list_election_names_with_suggestion(db_url, state, year, county)
-st.write("Adjust any incorrect types below (applies only to this export):")
+st.caption("If a mapping table isn't found, I'll use a heuristic to suggest the type. Your changes below override for this export only.")
+map_df, map_source = list_election_names_with_suggestion(db_url, state, year, county)
+st.caption(f"Suggestions source: {'public.vote_type_map' if map_source == 'map' else 'heuristic'}")
 
 edited_df = st.data_editor(
     map_df,
@@ -436,25 +464,24 @@ edited_df = st.data_editor(
     column_config={
         "election_name": st.column_config.TextColumn("Election Name", disabled=True, width="large"),
         "suggested_type": st.column_config.TextColumn("Suggested", disabled=True),
-        "vote_type": st.column_config.SelectboxColumn("Vote Type", options=VTYPE_ORDER, required=True)
+        "vote_type": st.column_config.SelectboxColumn("Vote Type", options=VTYPE_ORDER, required=True),
     },
     use_container_width=True,
-    num_rows="fixed"
+    num_rows="fixed",
 )
 
-# Build per-run overrides (only include rows where user changed the type)
 overrides: Dict[str, str] = {}
 for _, r in edited_df.iterrows():
     if r["vote_type"] != r["suggested_type"]:
         overrides[str(r["election_name"])] = str(r["vote_type"])
 
-# Preview & Export
-col_prev, col_export = st.columns([1,1])
+# Preview & Export (wider preview)
+col_prev, col_export = st.columns([3, 1])
 with col_prev:
     if st.button("Preview (first 100 rows)"):
         df_preview = fetch_combined(db_url, state, year, county, overrides)
         st.write(f"Rows: {len(df_preview):,}")
-        st.dataframe(df_preview.head(100))
+        st.dataframe(df_preview.head(100), use_container_width=True)
 
 with col_export:
     df_export = fetch_combined(db_url, state, year, county, overrides)
@@ -479,5 +506,10 @@ if orig_file is not None:
     if st.button("Run Diff", type="primary"):
         diffs = diff_dataframes(df_original, df_combined_for_diff, compare_cols or None, float_tol=float_tol, case_sensitive=case_sensitive)
         st.write(f"Found **{len(diffs):,}** difference records.")
-        st.dataframe(diffs.head(200))
-        st.download_button("Download Differences CSV", data=diffs.to_csv(index=False), file_name=f"differences__{state}__{county}__{year}.csv", mime="text/csv")
+        st.dataframe(diffs.head(200), use_container_width=True)
+        st.download_button(
+            "Download Differences CSV",
+            data=diffs.to_csv(index=False),
+            file_name=f"differences__{state}__{county}__{year}.csv",
+            mime="text/csv",
+        )
