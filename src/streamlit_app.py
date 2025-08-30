@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Streamlit UI for exporting precinct-level election data back to the original wide format,
-with optional per-run overrides that map election names to vote types, and a diff tool.
+with per-run mapping overrides, selective race inclusion, and a diff tool.
 
 Key behaviors:
 - Uses only DATABASE_URL env var (no input box).
 - ballots_cast column is present but intentionally left blank in exports.
-- Allows mapping election.name -> vote type in the UI (overrides apply for this run only).
-- If public.vote_type_map doesn't exist, falls back to heuristics.
+- UI: map election.name -> vote type (overrides apply for this run only).
+- UI: pick a subset of election names to include (e.g., only Presidential races).
+- Diff: treats numeric zero as equal to blank; excludes ballots_cast from comparisons.
 - Softer theme and wider preview table.
 
 Run:
@@ -188,12 +189,29 @@ def list_election_names_with_suggestion(
         names["vote_type"] = names["suggested_type"]
         return names[["election_name", "suggested_type", "vote_type"]], "heuristic"
 
+def build_name_filter_clause(names: Optional[List[str]], params: Dict[str, object]) -> str:
+    """Return ' AND e.name IN (:nm_0, :nm_1, ...)' and populate params accordingly, or '' if no filter."""
+    if not names:
+        return ""
+    placeholders = []
+    for i, nm in enumerate(names):
+        key = f"nm_{i}"
+        params[key] = nm
+        placeholders.append(f":{key}")
+    return " AND e.name IN (" + ", ".join(placeholders) + ")"
+
 def build_combined_query(
-        state: str, year: int, county_or_all: str, overrides: Dict[str, str], use_map: bool
+        state: str,
+        year: int,
+        county_or_all: str,
+        overrides: Dict[str, str],
+        use_map: bool,
+        include_names: Optional[List[str]],
 ) -> Tuple[str, Dict]:
     """
     Build SQL + params to produce the combined export, with optional per-run overrides
     of vote types by election name. ballots_cast is blanked after the query.
+    Filters to only the selected election names if provided.
     """
     county = None if (county_or_all is None or county_or_all.strip().lower() == "all") else county_or_all.strip()
     params: Dict[str, object] = {"state": state, "year": int(year)}
@@ -202,6 +220,7 @@ def build_combined_query(
     if county:
         where += " AND e.county = :county"
         params["county"] = county
+    where += build_name_filter_clause(include_names, params)
 
     # CTE 1: scoped_base
     if use_map:
@@ -311,13 +330,20 @@ def build_combined_query(
     return sql, params
 
 @st.cache_data(show_spinner=True)
-def fetch_combined(db_url: str, state: str, year: int, county_or_all: str, overrides: Dict[str, str]) -> pd.DataFrame:
+def fetch_combined(
+        db_url: str,
+        state: str,
+        year: int,
+        county_or_all: str,
+        overrides: Dict[str, str],
+        include_names: Optional[List[str]],
+) -> pd.DataFrame:
     eng = get_engine(db_url)
 
     # Try with mapping table; on error, fallback to heuristic
     for attempt in (0, 1):
         use_map = (attempt == 0)
-        sql, params = build_combined_query(state, int(year), county_or_all, overrides, use_map)
+        sql, params = build_combined_query(state, int(year), county_or_all, overrides, use_map, include_names)
         try:
             with eng.connect() as conn:
                 df = pd.read_sql(sql=text(sql), con=conn, params=params)
@@ -360,13 +386,33 @@ def try_float(v: str):
         return None
 
 def values_equal(v1: str, v2: str, float_tol: float, case_sensitive: bool) -> bool:
+    """
+    Equality rules:
+    - Case-insensitive by default.
+    - If one side is blank and the other is a numeric zero (e.g., '0', '0.0'), treat as equal.
+    - If both numeric, compare within float_tol.
+    - Else compare normalized strings.
+    """
     n1 = normalize_value(v1, case_sensitive)
     n2 = normalize_value(v2, case_sensitive)
+
+    # Blank vs blank
+    if n1 == "" and n2 == "":
+        return True
+
+    # Blank vs numeric zero
+    f1, f2 = try_float(n1), try_float(n2)
+    if (n1 == "" and f2 is not None and abs(f2) <= float_tol) or (n2 == "" and f1 is not None and abs(f1) <= float_tol):
+        return True
+
+    # Exact match after normalization
     if n1 == n2:
         return True
-    f1, f2 = try_float(n1), try_float(n2)
+
+    # Numeric with tolerance
     if f1 is not None and f2 is not None:
         return abs(f1 - f2) <= float_tol
+
     return False
 
 def diff_dataframes(
@@ -383,6 +429,8 @@ def diff_dataframes(
 
     if compare_cols is None:
         compare_cols = list((set(df1.columns) & set(df2.columns)) - set(KEYS))
+    # Remove ballots_cast from comparison per request
+    compare_cols = [c for c in compare_cols if c != "ballots_cast"]
     compare_cols = sorted(compare_cols)
 
     merged = df1.merge(df2, on=KEYS, how="outer", suffixes=("__f1","__f2"), indicator=True)
@@ -429,7 +477,7 @@ def diff_dataframes(
 
 # ---------- UI ----------
 st.title("Precinct Exporter & Diff")
-st.caption("Select State → Year → County, map election names to vote types if needed, and export a combined CSV. Optionally diff against an original file.")
+st.caption("Select State → Year → County, map/choose races, export combined CSV, and (optionally) diff against an original file.")
 
 db_url = os.getenv("DATABASE_URL", "").strip()
 if not db_url:
@@ -470,40 +518,56 @@ edited_df = st.data_editor(
     num_rows="fixed",
 )
 
+# Choose which election names to include (e.g., only Presidential)
+all_names = edited_df["election_name"].tolist()
+include_names = st.multiselect(
+    "Elections to include in export & diff",
+    options=all_names,
+    default=all_names,
+    help="Pick a subset if you only want, say, the Presidential races (e.g., 3 of 6)."
+)
+
+# Build overrides only for included names
 overrides: Dict[str, str] = {}
+included_set = set(include_names)
 for _, r in edited_df.iterrows():
-    if r["vote_type"] != r["suggested_type"]:
-        overrides[str(r["election_name"])] = str(r["vote_type"])
+    ename = str(r["election_name"])
+    if ename in included_set and r["vote_type"] != r["suggested_type"]:
+        overrides[ename] = str(r["vote_type"])
 
 # Preview & Export (wider preview)
 col_prev, col_export = st.columns([3, 1])
 with col_prev:
     if st.button("Preview (first 100 rows)"):
-        df_preview = fetch_combined(db_url, state, year, county, overrides)
+        df_preview = fetch_combined(db_url, state, year, county, overrides, include_names)
         st.write(f"Rows: {len(df_preview):,}")
         st.dataframe(df_preview.head(100), use_container_width=True)
 
 with col_export:
-    df_export = fetch_combined(db_url, state, year, county, overrides)
+    df_export = fetch_combined(db_url, state, year, county, overrides, include_names)
     fname = f"{state}__{county}__{year}.csv"
     st.download_button("Export CSV", data=df_export.to_csv(index=False), file_name=fname, mime="text/csv")
 
 st.markdown("---")
-st.subheader("Optional: Diff against original imported file")
-orig_file = st.file_uploader("Upload original CSV", type=["csv"], key="orig")
+st.subheader("Diff against original imported file (path on disk)")
+st.caption("Enter a local path to your original CSV (e.g., /Users/you/Downloads/original.csv or C:\\\\path\\\\file.csv).")
+orig_path = st.text_input("Original CSV path")
 float_tol = st.number_input("Numeric tolerance", min_value=0.0, max_value=100000.0, value=0.0, step=0.1)
 case_sensitive = st.checkbox("Case-sensitive string compare", value=False)
 
 compare_cols = None
-if orig_file is not None:
-    df_combined_for_diff = fetch_combined(db_url, state, year, county, overrides)
-    df_original = pd.read_csv(orig_file, dtype=str, keep_default_na=False)
-    shared_cols = sorted(list((set(df_combined_for_diff.columns) & set(df_original.columns)) - {"state","county","precinct"}))
-    with st.expander("Choose columns to compare (optional)"):
-        chosen = st.multiselect("Columns", options=shared_cols, default=shared_cols)
-        compare_cols = chosen
+if st.button("Run Diff", type="primary"):
+    if not orig_path or not os.path.isfile(orig_path):
+        st.error("Original CSV path not found. Please enter a valid local file path.")
+    else:
+        df_combined_for_diff = fetch_combined(db_url, state, year, county, overrides, include_names)
+        df_original = pd.read_csv(orig_path, dtype=str, keep_default_na=False)
+        shared_cols = sorted(list((set(df_combined_for_diff.columns) & set(df_original.columns)) - {"state","county","precinct","ballots_cast"}))
+        with st.expander("Choose columns to compare (optional)"):
+            chosen = st.multiselect("Columns", options=shared_cols, default=shared_cols, key="compare_cols_picker")
+            compare_cols = chosen if chosen else shared_cols
 
-    if st.button("Run Diff", type="primary"):
+        # Run immediately with chosen (or default) columns
         diffs = diff_dataframes(df_original, df_combined_for_diff, compare_cols or None, float_tol=float_tol, case_sensitive=case_sensitive)
         st.write(f"Found **{len(diffs):,}** difference records.")
         st.dataframe(diffs.head(200), use_container_width=True)
